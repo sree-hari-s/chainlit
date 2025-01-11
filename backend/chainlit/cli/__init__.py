@@ -1,31 +1,42 @@
 import asyncio
 import os
-import sys
 
 import click
 import nest_asyncio
 import uvicorn
 
+# Not sure if it is necessary to call nest_asyncio.apply() before the other imports
 nest_asyncio.apply()
 
+# ruff: noqa: E402
+from chainlit.auth import ensure_jwt_secret
 from chainlit.cache import init_lc_cache
-from chainlit.cli.auth import login, logout
-from chainlit.cli.deploy import deploy
-from chainlit.cli.utils import check_file
 from chainlit.config import (
     BACKEND_ROOT,
     DEFAULT_HOST,
     DEFAULT_PORT,
+    DEFAULT_ROOT_PATH,
     config,
     init_config,
+    lint_translations,
     load_module,
 )
 from chainlit.logger import logger
 from chainlit.markdown import init_markdown
-from chainlit.server import app, max_message_size, register_wildcard_route_handler
+from chainlit.secret import random_secret
 from chainlit.telemetry import trace_event
+from chainlit.utils import check_file
 
-from chainlit.db import init_local_db, migrate_local_db
+
+def assert_app():
+    if (
+        not config.code.on_chat_start
+        and not config.code.on_message
+        and not config.code.on_audio_chunk
+    ):
+        raise Exception(
+            "You need to configure at least one of on_chat_start, on_message or on_audio_chunk callback"
+        )
 
 
 # Create the main command group for Chainlit CLI
@@ -37,26 +48,43 @@ def cli():
 
 # Define the function to run Chainlit with provided options
 def run_chainlit(target: str):
+    from chainlit.server import app
+
     host = os.environ.get("CHAINLIT_HOST", DEFAULT_HOST)
     port = int(os.environ.get("CHAINLIT_PORT", DEFAULT_PORT))
+    root_path = os.environ.get("CHAINLIT_ROOT_PATH", DEFAULT_ROOT_PATH)
+
+    ssl_certfile = os.environ.get("CHAINLIT_SSL_CERT", None)
+    ssl_keyfile = os.environ.get("CHAINLIT_SSL_KEY", None)
+
+    ws_per_message_deflate_env = os.environ.get(
+        "UVICORN_WS_PER_MESSAGE_DEFLATE", "true"
+    )
+    ws_per_message_deflate = ws_per_message_deflate_env.lower() in [
+        "true",
+        "1",
+        "yes",
+    ]  # Convert to boolean
+
+    ws_protocol = os.environ.get("UVICORN_WS_PROTOCOL", "auto")
+
     config.run.host = host
     config.run.port = port
+    config.run.root_path = root_path
 
     check_file(target)
     # Load the module provided by the user
     config.run.module_name = target
     load_module(config.run.module_name)
 
-    register_wildcard_route_handler()
+    ensure_jwt_secret()
+    assert_app()
 
     # Create the chainlit.md file if it doesn't exist
     init_markdown(config.root)
 
     # Initialize the LangChain cache if installed and enabled
     init_lc_cache()
-
-    # Initialize the local database if configured to use it
-    init_local_db()
 
     log_level = "debug" if config.run.debug else "error"
 
@@ -66,8 +94,11 @@ def run_chainlit(target: str):
             app,
             host=host,
             port=port,
+            ws=ws_protocol,
             log_level=log_level,
-            ws_max_size=max_message_size,
+            ws_per_message_deflate=ws_per_message_deflate,
+            ssl_keyfile=ssl_keyfile,
+            ssl_certfile=ssl_certfile,
         )
         server = uvicorn.Server(config)
         await server.serve()
@@ -120,28 +151,55 @@ def run_chainlit(target: str):
     help="Useful to disable third parties cache, such as langchain.",
 )
 @click.option(
-    "--db",
-    type=click.Choice(["cloud", "local"]),
-    help="Useful to control database mode when running CI.",
+    "--ssl-cert",
+    default=None,
+    envvar="CHAINLIT_SSL_CERT",
+    help="Specify the file path for the SSL certificate.",
+)
+@click.option(
+    "--ssl-key",
+    default=None,
+    envvar="CHAINLIT_SSL_KEY",
+    help="Specify the file path for the SSL key",
 )
 @click.option("--host", help="Specify a different host to run the server on")
 @click.option("--port", help="Specify a different port to run the server on")
-def chainlit_run(target, watch, headless, debug, ci, no_cache, db, host, port):
+@click.option("--root-path", help="Specify a different root path to run the server on")
+def chainlit_run(
+    target,
+    watch,
+    headless,
+    debug,
+    ci,
+    no_cache,
+    ssl_cert,
+    ssl_key,
+    host,
+    port,
+    root_path,
+):
     if host:
         os.environ["CHAINLIT_HOST"] = host
     if port:
         os.environ["CHAINLIT_PORT"] = port
+    if bool(ssl_cert) != bool(ssl_key):
+        raise click.UsageError(
+            "Both --ssl-cert and --ssl-key must be provided together."
+        )
+    if ssl_cert:
+        os.environ["CHAINLIT_SSL_CERT"] = ssl_cert
+        os.environ["CHAINLIT_SSL_KEY"] = ssl_key
+    if root_path:
+        os.environ["CHAINLIT_ROOT_PATH"] = root_path
     if ci:
         logger.info("Running in CI mode")
-
-        if db:
-            config.project.database = db
 
         config.project.enable_telemetry = False
         no_cache = True
         # This is required to have OpenAI LLM providers available for the CI run
         os.environ["OPENAI_API_KEY"] = "sk-FAKE-OPENAI-API-KEY"
-
+        # This is required for authentication tests
+        os.environ["CHAINLIT_AUTH_SECRET"] = "SUPER_SECRET"  # nosec B105
     else:
         trace_event("chainlit run")
 
@@ -150,17 +208,10 @@ def chainlit_run(target, watch, headless, debug, ci, no_cache, db, host, port):
     config.run.no_cache = no_cache
     config.run.ci = ci
     config.run.watch = watch
+    config.run.ssl_cert = ssl_cert
+    config.run.ssl_key = ssl_key
 
     run_chainlit(target)
-
-
-@cli.command("deploy")
-@click.argument("target", required=True, envvar="CHAINLIT_RUN_TARGET")
-@click.argument("args", nargs=-1)
-def chainlit_deploy(target, args=None, **kwargs):
-    trace_event("chainlit deploy")
-    raise NotImplementedError("Deploy is not yet implemented")
-    deploy(target)
 
 
 @cli.command("hello")
@@ -171,32 +222,26 @@ def chainlit_hello(args=None, **kwargs):
     run_chainlit(hello_path)
 
 
-@cli.command("login")
-@click.argument("args", nargs=-1)
-def chainlit_login(args=None, **kwargs):
-    trace_event("chainlit login")
-    login()
-    sys.exit(0)
-
-
-@cli.command("logout")
-@click.argument("args", nargs=-1)
-def chainlit_logout(args=None, **kwargs):
-    trace_event("chainlit logout")
-    logout()
-    sys.exit(0)
-
-
-@cli.command("migrate")
-@click.argument("args", nargs=-1)
-def chainlit_migrate(args=None, **kwargs):
-    trace_event("chainlit migrate")
-    migrate_local_db()
-    sys.exit(0)
-
-
 @cli.command("init")
 @click.argument("args", nargs=-1)
 def chainlit_init(args=None, **kwargs):
     trace_event("chainlit init")
     init_config(log=True)
+
+
+@cli.command("create-secret")
+@click.argument("args", nargs=-1)
+def chainlit_create_secret(args=None, **kwargs):
+    trace_event("chainlit secret")
+
+    print(
+        f'Copy the following secret into your .env file. Once it is set, changing it will logout all users with active sessions.\nCHAINLIT_AUTH_SECRET="{random_secret()}"'
+    )
+
+
+@cli.command("lint-translations")
+@click.argument("args", nargs=-1)
+def chainlit_lint_translations(args=None, **kwargs):
+    trace_event("chainlit lint-translation")
+
+    lint_translations()

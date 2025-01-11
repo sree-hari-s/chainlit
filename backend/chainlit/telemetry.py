@@ -9,7 +9,6 @@ import logging
 from functools import wraps
 from socket import gethostname
 
-import uptrace
 from chainlit.config import config
 from chainlit.version import __version__
 
@@ -32,9 +31,6 @@ class ChainlitTelemetry:
         if resource:
             return resource
 
-        # If we are in production, use the URL as hostname
-        if config.chainlit_prod_url:
-            host_name = config.chainlit_prod_url
         # Hash the local hostname to avoid leaking it.
         else:
             host_name = gethostname()
@@ -43,7 +39,7 @@ class ChainlitTelemetry:
         attrs = {"host.name": host_name}
 
         if resource_attributes:
-            attrs.update(resource_attributes)
+            attrs.update(resource_attributes)  # type: ignore
         if service_name:
             attrs["service.name"] = service_name
         if service_version:
@@ -51,9 +47,10 @@ class ChainlitTelemetry:
         if deployment_environment:
             attrs["deployment.environment"] = deployment_environment
 
-        return Resource.create(attrs)
+        return Resource.create(attrs)  # type: ignore
 
     def configure_tracer(self):
+        import uptrace
         from opentelemetry.exporter.otlp.proto.grpc.exporter import (
             logger as exporter_logger,
         )
@@ -67,7 +64,6 @@ class ChainlitTelemetry:
         uptrace.configure_opentelemetry(
             dsn="https://YPa4AbDF853uCW6UWN2oYg@api.uptrace.dev/1778",
             service_name="chainlit",
-            service_version="1.1.0",
             deployment_environment="production",
             logging_level=logging.CRITICAL,
         )

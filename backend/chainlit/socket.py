@@ -1,50 +1,66 @@
 import asyncio
 import json
-from http.cookies import SimpleCookie
-from typing import Any, Dict
+from typing import Any, Dict, Literal, Optional, Tuple, Union
+from urllib.parse import unquote
 
-from chainlit.action import Action
-from chainlit.client.base import MessageDict
-from chainlit.client.cloud import CloudAuthClient
-from chainlit.client.utils import get_auth_client, get_db_client
+from starlette.requests import cookie_parser
+from typing_extensions import TypeAlias
+
+from chainlit.auth import get_current_user, require_login
+from chainlit.chat_context import chat_context
 from chainlit.config import config
-from chainlit.context import init_context
-from chainlit.emitter import ChainlitEmitter
+from chainlit.context import init_ws_context
+from chainlit.data import get_data_layer
 from chainlit.logger import logger
 from chainlit.message import ErrorMessage, Message
-from chainlit.server import socket
-from chainlit.session import Session
+from chainlit.server import sio
+from chainlit.session import WebsocketSession
 from chainlit.telemetry import trace_event
-from chainlit.types import FileSpec
+from chainlit.types import InputAudioChunk, InputAudioChunkPayload, MessagePayload
+from chainlit.user import PersistedUser, User
 from chainlit.user_session import user_sessions
 
-
-def load_chainlit_initial_headers(http_cookie):
-    cookie = SimpleCookie(http_cookie)
-    cookie_string = ""
-    initial_headers = cookie.get("chainlit-initial-headers")
-    if initial_headers:
-        cookie_string = initial_headers.value
-    if cookie_string:
-        try:
-            chainlit_initial_headers = json.loads(cookie_string)
-        except ValueError:
-            chainlit_initial_headers = {}
-    else:
-        chainlit_initial_headers = {}
-
-    return chainlit_initial_headers
+WSGIEnvironment: TypeAlias = dict[str, Any]
 
 
-def restore_existing_session(sid, session_id, emit_fn, ask_user_fn):
+def restore_existing_session(sid, session_id, emit_fn, emit_call_fn):
     """Restore a session from the sessionId provided by the client."""
-    if session := Session.get_by_id(session_id):
+    if session := WebsocketSession.get_by_id(session_id):
         session.restore(new_socket_id=sid)
         session.emit = emit_fn
-        session.ask_user = ask_user_fn
+        session.emit_call = emit_call_fn
         trace_event("session_restored")
         return True
     return False
+
+
+async def persist_user_session(thread_id: str, metadata: Dict):
+    if data_layer := get_data_layer():
+        await data_layer.update_thread(thread_id=thread_id, metadata=metadata)
+
+
+async def resume_thread(session: WebsocketSession):
+    data_layer = get_data_layer()
+    if not data_layer or not session.user or not session.thread_id_to_resume:
+        return
+    thread = await data_layer.get_thread(thread_id=session.thread_id_to_resume)
+    if not thread:
+        return
+
+    author = thread.get("userIdentifier")
+    user_is_author = author == session.user.identifier
+
+    if user_is_author:
+        metadata = thread.get("metadata") or {}
+        user_sessions[session.id] = metadata.copy()
+        if chat_profile := metadata.get("chat_profile"):
+            session.chat_profile = chat_profile
+        if chat_settings := metadata.get("chat_settings"):
+            session.chat_settings = chat_settings
+
+        trace_event("thread_resumed")
+
+        return thread
 
 
 def load_user_env(user_env):
@@ -64,137 +80,190 @@ def load_user_env(user_env):
     return user_env
 
 
-@socket.on("connect")
+def _get_token_from_cookie(environ: WSGIEnvironment) -> Optional[str]:
+    if cookie_header := environ.get("HTTP_COOKIE", None):
+        cookies = cookie_parser(cookie_header)
+        return cookies.get("access_token", None)
+
+    return None
+
+
+def _get_token(environ: WSGIEnvironment, auth: dict) -> Optional[str]:
+    """Take WSGI environ, return access token."""
+    return _get_token_from_cookie(environ)
+
+
+async def _authenticate_connection(
+    environ,
+    auth,
+) -> Union[Tuple[Union[User, PersistedUser], str], Tuple[None, None]]:
+    if token := _get_token(environ, auth):
+        user = await get_current_user(token=token)
+        if user:
+            return user, token
+
+    return None, None
+
+
+@sio.on("connect")  # pyright: ignore [reportOptionalCall]
 async def connect(sid, environ, auth):
-    # Function to send a message to this particular session
+    user = token = None
+
+    if require_login():
+        try:
+            user, token = await _authenticate_connection(environ, auth)
+        except Exception as e:
+            logger.exception("Exception authenticating connection: %s", e)
+
+        if not user:
+            logger.error("Authentication failed in websocket connect.")
+            raise ConnectionRefusedError("authentication failed")
+
+    # Session scoped function to emit to the client
     def emit_fn(event, data):
-        if session := Session.get(sid):
-            if session.should_stop:
-                session.should_stop = False
-                raise InterruptedError("Task stopped by user")
-        return socket.emit(event, data, to=sid)
+        return sio.emit(event, data, to=sid)
 
-    # Function to ask the user a question
-    def ask_user_fn(data, timeout):
-        if session := Session.get(sid):
-            if session.should_stop:
-                session.should_stop = False
-                raise InterruptedError("Task stopped by user")
-        return socket.call("ask", data, timeout=timeout, to=sid)
+    # Session scoped function to emit to the client and wait for a response
+    def emit_call_fn(event: Literal["ask", "call_fn"], data, timeout):
+        return sio.call(event, data, timeout=timeout, to=sid)
 
-    session_id = environ.get("HTTP_X_CHAINLIT_SESSION_ID")
-    if restore_existing_session(sid, session_id, emit_fn, ask_user_fn):
+    session_id = auth.get("sessionId")
+    if restore_existing_session(sid, session_id, emit_fn, emit_call_fn):
         return True
 
-    request_headers = load_chainlit_initial_headers(environ.get("HTTP_COOKIE"))
+    user_env_string = auth.get("userEnv")
+    user_env = load_user_env(user_env_string)
 
-    db_client = None
-    user_env = environ.get("HTTP_USER_ENV")
+    client_type = auth.get("clientType")
+    http_referer = environ.get("HTTP_REFERER")
+    http_cookie = environ.get("HTTP_COOKIE")
+    url_encoded_chat_profile = auth.get("chatProfile")
+    chat_profile = (
+        unquote(url_encoded_chat_profile) if url_encoded_chat_profile else None
+    )
 
-    try:
-        auth_client = await get_auth_client(
-            handshake_headers=environ, request_headers=request_headers
-        )
-        if config.project.database:
-            db_client = await get_db_client(
-                handshake_headers=environ,
-                request_headers=request_headers,
-                user_infos=auth_client.user_infos,
-            )
-        user_env = load_user_env(user_env)
-    except ConnectionRefusedError as e:
-        logger.error(f"ConnectionRefusedError: {e}")
-        return False
-
-    Session(
+    WebsocketSession(
         id=session_id,
         socket_id=sid,
         emit=emit_fn,
-        ask_user=ask_user_fn,
-        auth_client=auth_client,
-        db_client=db_client,
+        emit_call=emit_call_fn,
+        client_type=client_type,
         user_env=user_env,
-        initial_headers=request_headers,
+        user=user,
+        token=token,
+        chat_profile=chat_profile,
+        thread_id=auth.get("threadId"),
+        languages=environ.get("HTTP_ACCEPT_LANGUAGE"),
+        http_referer=http_referer,
+        http_cookie=http_cookie,
     )
 
     trace_event("connection_successful")
     return True
 
 
-@socket.on("connection_successful")
+@sio.on("connection_successful")  # pyright: ignore [reportOptionalCall]
 async def connection_successful(sid):
-    context = init_context(sid)
+    context = init_ws_context(sid)
+
+    await context.emitter.task_end()
+    await context.emitter.clear("clear_ask")
+    await context.emitter.clear("clear_call_fn")
+
     if context.session.restored:
         return
 
-    if isinstance(
-        context.session.auth_client, CloudAuthClient
-    ) and config.project.database in [
-        "local",
-        "custom",
-    ]:
-        await context.session.db_client.create_user(
-            context.session.auth_client.user_infos
-        )
+    if context.session.thread_id_to_resume and config.code.on_chat_resume:
+        thread = await resume_thread(context.session)
+        if thread:
+            context.session.has_first_interaction = True
+            await context.emitter.emit(
+                "first_interaction",
+                {"interaction": "resume", "thread_id": thread.get("id")},
+            )
+            await config.code.on_chat_resume(thread)
 
-    if config.code.on_file_upload:
-        await context.emitter.enable_file_upload(config.code.on_file_upload_config)
+            for step in thread.get("steps", []):
+                if "message" in step["type"]:
+                    chat_context.add(Message.from_dict(step))
+
+            await context.emitter.resume_thread(thread)
+            return
+        else:
+            await context.emitter.send_resume_thread_error("Thread not found.")
 
     if config.code.on_chat_start:
-        """Call the on_chat_start function provided by the developer."""
-        await config.code.on_chat_start()
+        task = asyncio.create_task(config.code.on_chat_start())
+        context.session.current_task = task
 
 
-@socket.on("clear_session")
+@sio.on("clear_session")  # pyright: ignore [reportOptionalCall]
 async def clean_session(sid):
-    if session := Session.get(sid):
-        # Clean up the user session
-        if session.id in user_sessions:
-            user_sessions.pop(session.id)
-        # Clean up the session
-        session.delete()
+    session = WebsocketSession.get(sid)
+    if session:
+        session.to_clear = True
 
 
-@socket.on("disconnect")
+@sio.on("disconnect")  # pyright: ignore [reportOptionalCall]
 async def disconnect(sid):
-    async def disconnect_on_timeout(sid):
-        await asyncio.sleep(config.project.session_timeout)
-        if session := Session.get(sid):
+    session = WebsocketSession.get(sid)
+
+    if not session:
+        return
+
+    init_ws_context(session)
+
+    if config.code.on_chat_end:
+        await config.code.on_chat_end()
+
+    if session.thread_id and session.has_first_interaction:
+        await persist_user_session(session.thread_id, session.to_persistable())
+
+    def clear(_sid):
+        if session := WebsocketSession.get(_sid):
             # Clean up the user session
             if session.id in user_sessions:
                 user_sessions.pop(session.id)
             # Clean up the session
             session.delete()
 
-    asyncio.ensure_future(disconnect_on_timeout(sid))
+    if session.to_clear:
+        clear(sid)
+    else:
+
+        async def clear_on_timeout(_sid):
+            await asyncio.sleep(config.project.session_timeout)
+            clear(_sid)
+
+        asyncio.ensure_future(clear_on_timeout(sid))
 
 
-@socket.on("stop")
+@sio.on("stop")  # pyright: ignore [reportOptionalCall]
 async def stop(sid):
-    if session := Session.get(sid):
+    if session := WebsocketSession.get(sid):
         trace_event("stop_task")
 
-        context = init_context(session)
-        await Message(author="System", content="Task stopped by the user.").send()
+        init_ws_context(session)
+        await Message(content="Task manually stopped.").send()
 
-        session.should_stop = True
+        if session.current_task:
+            session.current_task.cancel()
 
         if config.code.on_stop:
             await config.code.on_stop()
 
 
-async def process_message(session: Session, message_dict: MessageDict):
+async def process_message(session: WebsocketSession, payload: MessagePayload):
     """Process a message from the user."""
     try:
-        context = init_context(session)
-
+        context = init_ws_context(session)
         await context.emitter.task_start()
-        await context.emitter.process_user_message(message_dict)
+        message = await context.emitter.process_message(payload)
 
-        message = Message.from_dict(message_dict)
         if config.code.on_message:
-            await config.code.on_message(message.content.strip(), message.id)
-    except InterruptedError:
+            await asyncio.sleep(0.001)
+            await config.code.on_message(message)
+    except asyncio.CancelledError:
         pass
     except Exception as e:
         logger.exception(e)
@@ -205,49 +274,114 @@ async def process_message(session: Session, message_dict: MessageDict):
         await context.emitter.task_end()
 
 
-@socket.on("ui_message")
-async def message(sid, message):
+@sio.on("edit_message")  # pyright: ignore [reportOptionalCall]
+async def edit_message(sid, payload: MessagePayload):
     """Handle a message sent by the User."""
-    session = Session.require(sid)
-    session.should_stop = False
+    session = WebsocketSession.require(sid)
+    context = init_ws_context(session)
 
-    await process_message(session, message)
+    messages = chat_context.get()
+
+    orig_message = None
+
+    for message in messages:
+        if orig_message:
+            await message.remove()
+
+        if message.id == payload["message"]["id"]:
+            message.content = payload["message"]["output"]
+            await message.update()
+            orig_message = message
+
+    await context.emitter.task_start()
+
+    if config.code.on_message:
+        try:
+            await config.code.on_message(orig_message)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await context.emitter.task_end()
 
 
-async def process_action(action: Action):
-    callback = config.code.action_callbacks.get(action.name)
-    if callback:
-        await callback(action)
-    else:
-        logger.warning("No callback found for action %s", action.name)
+@sio.on("client_message")  # pyright: ignore [reportOptionalCall]
+async def message(sid, payload: MessagePayload):
+    """Handle a message sent by the User."""
+    session = WebsocketSession.require(sid)
+
+    task = asyncio.create_task(process_message(session, payload))
+    session.current_task = task
 
 
-@socket.on("action_call")
-async def call_action(sid, action):
-    """Handle an action call from the UI."""
-    init_context(sid)
+@sio.on("window_message")  # pyright: ignore [reportOptionalCall]
+async def window_message(sid, data):
+    """Handle a message send by the host window."""
+    session = WebsocketSession.require(sid)
+    init_ws_context(session)
 
-    action = Action(**action)
+    if config.code.on_window_message:
+        try:
+            await config.code.on_window_message(data)
+        except asyncio.CancelledError:
+            pass
 
-    await process_action(action)
+
+@sio.on("audio_start")  # pyright: ignore [reportOptionalCall]
+async def audio_start(sid):
+    """Handle audio init."""
+    session = WebsocketSession.require(sid)
+
+    context = init_ws_context(session)
+    if config.code.on_audio_start:
+        connected = bool(await config.code.on_audio_start())
+        connection_state = "on" if connected else "off"
+        await context.emitter.update_audio_connection(connection_state)
 
 
-@socket.on("chat_settings_change")
+@sio.on("audio_chunk")
+async def audio_chunk(sid, payload: InputAudioChunkPayload):
+    """Handle an audio chunk sent by the user."""
+    session = WebsocketSession.require(sid)
+
+    init_ws_context(session)
+
+    if config.code.on_audio_chunk:
+        asyncio.create_task(config.code.on_audio_chunk(InputAudioChunk(**payload)))
+
+
+@sio.on("audio_end")
+async def audio_end(sid):
+    """Handle the end of the audio stream."""
+    session = WebsocketSession.require(sid)
+    try:
+        context = init_ws_context(session)
+        await context.emitter.task_start()
+
+        if not session.has_first_interaction:
+            session.has_first_interaction = True
+            asyncio.create_task(context.emitter.init_thread("audio"))
+
+        if config.code.on_audio_end:
+            await config.code.on_audio_end()
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.exception(e)
+        await ErrorMessage(
+            author="Error", content=str(e) or e.__class__.__name__
+        ).send()
+    finally:
+        await context.emitter.task_end()
+
+
+@sio.on("chat_settings_change")
 async def change_settings(sid, settings: Dict[str, Any]):
     """Handle change settings submit from the UI."""
-    context = init_context(sid)
+    context = init_ws_context(sid)
 
     for key, value in settings.items():
         context.session.chat_settings[key] = value
 
     if config.code.on_settings_update:
         await config.code.on_settings_update(settings)
-
-
-@socket.on("file_upload")
-async def file_upload(sid, files: Any):
-    """Handle file upload from the UI."""
-    init_context(sid)
-
-    if config.code.on_file_upload:
-        await config.code.on_file_upload(files)

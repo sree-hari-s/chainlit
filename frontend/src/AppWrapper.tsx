@@ -1,37 +1,54 @@
+import getRouterBasename from '@/lib/router';
 import App from 'App';
-import { useEffect } from 'react';
-import { useRecoilState, useSetRecoilState } from 'recoil';
+import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 
-import AuthProvider from 'components/atoms/authProvider';
-
-import { useApi } from 'hooks/useApi';
-
-import { IProjectSettings, projectSettingsState } from 'state/project';
-import { settingsState } from 'state/settings';
+import {
+  useApi,
+  useAuth,
+  useChatInteract,
+  useConfig
+} from '@chainlit/react-client';
 
 export default function AppWrapper() {
-  const [pSettings, setPSettings] = useRecoilState(projectSettingsState);
-  const setAppSettings = useSetRecoilState(settingsState);
+  const [translationLoaded, setTranslationLoaded] = useState(false);
+  const { isAuthenticated, isReady } = useAuth();
+  const { language: languageInUse } = useConfig();
+  const { i18n } = useTranslation();
+  const { windowMessage } = useChatInteract();
 
-  const { data } = useApi<IProjectSettings>(
-    pSettings === undefined ? '/project/settings' : null
+  function handleChangeLanguage(languageBundle: any): void {
+    i18n.addResourceBundle(languageInUse, 'translation', languageBundle);
+    i18n.changeLanguage(languageInUse);
+  }
+
+  const { data: translations } = useApi<any>(
+    `/project/translations?language=${languageInUse}`
   );
 
   useEffect(() => {
-    if (!data) return;
+    if (!translations) return;
+    handleChangeLanguage(translations.translation);
+    setTranslationLoaded(true);
+  }, [translations]);
 
-    setPSettings(data);
-    setAppSettings((prev) => ({
-      ...prev,
-      defaultCollapseContent: data.ui.default_collapse_content ?? true,
-      expandAll: !!data.ui.default_expand_messages,
-      hideCot: !!data.ui.hide_cot
-    }));
-  }, [data]);
+  useEffect(() => {
+    const handleWindowMessage = (event: MessageEvent) => {
+      windowMessage(event.data);
+    };
+    window.addEventListener('message', handleWindowMessage);
+    return () => window.removeEventListener('message', handleWindowMessage);
+  }, [windowMessage]);
 
-  return (
-    <AuthProvider>
-      <App />
-    </AuthProvider>
-  );
+  if (!translationLoaded) return null;
+
+  if (
+    isReady &&
+    !isAuthenticated &&
+    window.location.pathname !== getRouterBasename() + '/login' &&
+    window.location.pathname !== getRouterBasename() + '/login/callback'
+  ) {
+    window.location.href = getRouterBasename() + '/login';
+  }
+  return <App />;
 }

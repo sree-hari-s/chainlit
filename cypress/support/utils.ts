@@ -4,7 +4,6 @@ import { join } from 'path';
 const ROOT = process.cwd();
 export const E2E_DIR = join(ROOT, 'cypress/e2e');
 export const BACKEND_DIR = join(ROOT, 'backend');
-const FRONTEND_DIR = join(ROOT, 'frontend');
 export const CHAINLIT_PORT = 8000;
 
 export enum ExecutionMode {
@@ -20,7 +19,9 @@ export async function runTests(matchName) {
   // Recording the cypress run is time consuming. Disabled by default.
   // const recordOptions = ` --record --key ${process.env.CYPRESS_RECORD_KEY} `;
   return runCommand(
-    `pnpm exec cypress run --record false --spec "cypress/e2e/${matchName}/spec.cy.ts"`
+    `pnpm exec cypress run --record false ${
+      process.env.CYPRESS_OPTIONS || ''
+    } --spec "cypress/e2e/${matchName}/spec.cy.ts"`
   );
 }
 

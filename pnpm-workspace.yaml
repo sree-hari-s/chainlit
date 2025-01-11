@@ -1,3 +1,5 @@
 packages:
-  - 'frontend/'
-  - 'libs/components/'
+  - frontend/
+  - libs/react-components/
+  - libs/react-client/
+  - libs/copilot/
