@@ -3,7 +3,7 @@
     "target": "ESNext",
     "useDefineForClassFields": true,
     "lib": ["DOM", "DOM.Iterable", "ESNext"],
-    "baseUrl": "src",
+    "baseUrl": "./src",
     "allowJs": false,
     "skipLibCheck": true,
     "esModuleInterop": false,
@@ -17,8 +17,12 @@
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    "types": ["@testing-library/jest-dom"]
+    "types": ["node"],
+    "paths": {
+      "client-types/*": ["../../libs/react-client/dist"],
+      "@/*": ["./*"]
+    }
   },
-  "include": ["src"],
+  "include": ["./src"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

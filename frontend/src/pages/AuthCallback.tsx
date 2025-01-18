@@ -1,13 +1,16 @@
 import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-import { Alert } from '@mui/material';
-
-import { useAuth } from 'hooks/auth';
+import { useAuth } from '@chainlit/react-client';
 
 export default function AuthCallback() {
-  const { user, error } = useAuth();
+  const { user, setUserFromAPI } = useAuth();
   const navigate = useNavigate();
+
+  // Fetch user in cookie-based oauth.
+  useEffect(() => {
+    if (!user) setUserFromAPI();
+  }, []);
 
   useEffect(() => {
     if (user) {
@@ -15,8 +18,5 @@ export default function AuthCallback() {
     }
   }, [user]);
 
-  if (error) {
-    return <Alert severity="error">{error.message}</Alert>;
-  }
   return null;
 }

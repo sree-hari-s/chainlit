@@ -1,137 +1,78 @@
 import { useEffect } from 'react';
-import { Toaster } from 'react-hot-toast';
 import { RouterProvider } from 'react-router-dom';
-import { useRecoilState, useRecoilValue } from 'recoil';
+import { useRecoilValue } from 'recoil';
 import { router } from 'router';
 
-import { Box, GlobalStyles, Theme } from '@mui/material';
-import { ThemeProvider } from '@mui/material';
+import { useAuth, useChatSession, useConfig } from '@chainlit/react-client';
 
-import { makeTheme } from '@chainlit/components/theme';
+import ChatSettingsModal from './components/ChatSettings';
+import { ThemeProvider } from './components/ThemeProvider';
+import { Toaster } from '@/components/ui/sonner';
 
-import Hotkeys from 'components/Hotkeys';
-import SettingsModal from 'components/molecules/settingsModal';
-import Socket from 'components/socket';
-
-import { useAuth } from 'hooks/auth';
-import { useApi } from 'hooks/useApi';
-
-import { settingsState } from 'state/settings';
-import { accessTokenState, roleState } from 'state/user';
-
-import { Role } from 'types/user';
-
-import './App.css';
-
-type Primary = {
-  dark?: string;
-  light?: string;
-  main?: string;
-};
-
-type ThemOverride = {
-  primary?: Primary;
-  background?: string;
-  paper?: string;
-};
+import { userEnvState } from 'state/user';
 
 declare global {
   interface Window {
+    cl_shadowRootElement?: HTMLDivElement;
+    transports?: string[];
     theme?: {
-      light?: ThemOverride;
-      dark?: ThemOverride;
+      light: Record<string, string>;
+      dark: Record<string, string>;
     };
   }
 }
 
-function overrideTheme(theme: Theme) {
-  const variant = theme.palette.mode;
-  const variantOverride = window?.theme?.[variant] as ThemOverride;
-  if (variantOverride?.background) {
-    theme.palette.background.default = variantOverride.background;
-  }
-  if (variantOverride?.paper) {
-    theme.palette.background.paper = variantOverride.paper;
-  }
-  if (variantOverride?.primary?.main) {
-    theme.palette.primary.main = variantOverride.primary.main;
-  }
-  if (variantOverride?.primary?.dark) {
-    theme.palette.primary.dark = variantOverride.primary.dark;
-  }
-  if (variantOverride?.primary?.light) {
-    theme.palette.primary.light = variantOverride.primary.light;
-  }
-
-  return theme;
-}
-
 function App() {
-  const { theme: themeVariant } = useRecoilValue(settingsState);
-  const [accessToken, setAccessToken] = useRecoilState(accessTokenState);
-  const [role, setRole] = useRecoilState(roleState);
-  const { isAuthenticated, getAccessTokenSilently, logout } = useAuth();
-  const theme = overrideTheme(makeTheme(themeVariant));
+  const { config } = useConfig();
 
-  const { data: roleData, error: roleError } = useApi<Role>(
-    !role && accessToken ? '/project/role' : null
-  );
+  const { isAuthenticated, data, isReady } = useAuth();
+  const userEnv = useRecoilValue(userEnvState);
+  const { connect, chatProfile, setChatProfile } = useChatSession();
 
-  useEffect(() => {
-    if (roleData !== 'ANONYMOUS' && !role) {
-      setRole(roleError ? 'ANONYMOUS' : roleData);
-    }
-  }, [roleData, roleError]);
+  const configLoaded = !!config;
+
+  const chatProfileOk = configLoaded
+    ? config.chatProfiles.length
+      ? !!chatProfile
+      : true
+    : false;
 
   useEffect(() => {
-    if (isAuthenticated && accessToken === undefined) {
-      getAccessTokenSilently({
-        authorizationParams: {
-          audience: 'chainlit-cloud'
-        }
-      })
-        .then((token) => setAccessToken(token))
-        .catch((err) => {
-          console.error(err);
-          logout({
-            logoutParams: {
-              returnTo: window.location.origin
-            }
-          });
-        });
+    if (!isAuthenticated || !isReady) {
+      return;
+    } else if (!chatProfileOk) {
+      return;
+    } else {
+      connect({
+        transports: window.transports,
+        userEnv
+      });
     }
-  }, [isAuthenticated, getAccessTokenSilently, accessToken, setAccessToken]);
+  }, [userEnv, isAuthenticated, connect, isReady, chatProfileOk]);
+
+  if (configLoaded && config.chatProfiles.length && !chatProfile) {
+    // Autoselect the first default chat profile
+    const defaultChatProfile = config.chatProfiles.find(
+      (profile) => profile.default
+    );
+    if (defaultChatProfile) {
+      setChatProfile(defaultChatProfile.name);
+    } else {
+      setChatProfile(config.chatProfiles[0].name);
+    }
+  }
+
+  if (!configLoaded && isAuthenticated) return null;
 
   return (
-    <ThemeProvider theme={theme}>
-      <GlobalStyles
-        styles={{
-          body: { backgroundColor: theme.palette.background.default }
-        }}
-      />
-      <Toaster
-        toastOptions={{
-          className: 'toast',
-          style: {
-            maxWidth: 500,
-            fontFamily: 'Inter',
-            background: theme.palette.background.paper,
-            border: `1px solid ${theme.palette.divider}`,
-            padding: theme.spacing(1),
-            color: theme.palette.text.primary,
-            boxShadow:
-              theme.palette.mode === 'light'
-                ? '0px 2px 4px 0px #0000000D'
-                : '0px 10px 10px 0px #0000000D'
-          }
-        }}
-      />
-      <Box display="flex" height="100vh" width="100vw">
-        <Socket />
-        <Hotkeys />
-        <SettingsModal />
-        <RouterProvider router={router} />
-      </Box>
+    <ThemeProvider
+      storageKey="vite-ui-theme"
+      defaultTheme={data?.default_theme}
+    >
+      <Toaster className="toast" position="top-right" />
+
+      <ChatSettingsModal />
+      <RouterProvider router={router} />
     </ThemeProvider>
   );
 }

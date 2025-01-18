@@ -1,68 +1,36 @@
-import { useCallback, useState } from 'react';
+import { useCallback } from 'react';
 import {
   DropzoneOptions,
   FileRejection,
   FileWithPath,
   useDropzone
 } from 'react-dropzone';
-import toast from 'react-hot-toast';
 
-import { FileSpec, IFileResponse } from 'types/chat';
+import type { FileSpec } from 'client-types/';
 
 interface useUploadProps {
-  onResolved: (payloads: IFileResponse[]) => void;
+  onError?: (error: string) => void;
+  onResolved: (payloads: FileWithPath[]) => void;
+  options?: DropzoneOptions;
   spec: FileSpec;
 }
 
-const useUpload = ({ onResolved, spec }: useUploadProps) => {
-  const [uploading, setUploading] = useState(false);
-
+const useUpload = ({ onError, onResolved, options, spec }: useUploadProps) => {
   const onDrop: DropzoneOptions['onDrop'] = useCallback(
     (acceptedFiles: FileWithPath[], fileRejections: FileRejection[]) => {
       if (fileRejections.length > 0) {
-        toast.error(fileRejections[0].errors[0].message);
-        return;
+        if (fileRejections[0].errors[0].code === 'file-too-large') {
+          onError?.(`File is larger than ${spec.max_size_mb} MB`);
+        } else {
+          onError?.(fileRejections[0].errors[0].message);
+        }
       }
 
       if (!acceptedFiles.length) return;
-      setUploading(true);
-
-      const promises = acceptedFiles.map((file) => {
-        return new Promise<IFileResponse>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = function (e) {
-            const rawData = e.target?.result;
-            const payload: IFileResponse = {
-              path: file.path,
-              name: file.name,
-              size: file.size,
-              type: file.type,
-              content: rawData as ArrayBuffer
-            };
-            resolve(payload);
-          };
-          reader.onerror = function () {
-            if (!reader.error) return;
-            reject(reader.error.message);
-          };
-          reader.readAsArrayBuffer(file);
-        });
-      });
-
-      Promise.all(promises)
-        .then((payloads) => {
-          onResolved(payloads);
-          setUploading(false);
-        })
-        .catch((err) => {
-          toast.error(err);
-          setUploading(false);
-        });
+      return onResolved(acceptedFiles);
     },
     [spec]
   );
-
-  if (!spec.accept || !spec.max_size_mb) return null;
 
   let dzAccept: Record<string, string[]> = {};
   const accept = spec.accept;
@@ -77,15 +45,15 @@ const useUpload = ({ onResolved, spec }: useUploadProps) => {
     dzAccept = accept;
   }
 
-  // eslint-disable-next-line react-hooks/rules-of-hooks
-  const { getRootProps, getInputProps } = useDropzone({
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    maxFiles: spec.max_files || 1,
+    maxFiles: spec.max_files || undefined,
     accept: dzAccept,
-    maxSize: spec.max_size_mb * 1000000
+    maxSize: (spec.max_size_mb || 2) * 1000000,
+    ...options
   });
 
-  return { getRootProps, getInputProps, uploading };
+  return { getInputProps, getRootProps, isDragActive };
 };
 
-export default useUpload;
+export { useUpload };

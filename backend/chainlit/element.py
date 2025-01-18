@@ -1,33 +1,85 @@
 import json
+import mimetypes
 import uuid
 from enum import Enum
 from io import BytesIO
-from typing import Any, ClassVar, Dict, List, Optional, TypeVar, Union, cast
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    TypedDict,
+    TypeVar,
+    Union,
+)
 
-import aiofiles
 import filetype
-from chainlit.client.base import BaseDBClient, ElementDict
+from pydantic import Field
+from pydantic.dataclasses import dataclass
+from syncer import asyncio
+
 from chainlit.context import context
+from chainlit.data import get_data_layer
+from chainlit.logger import logger
 from chainlit.telemetry import trace_event
-from chainlit.types import ElementDisplay, ElementSize, ElementType
-from pydantic.dataclasses import Field, dataclass
+from chainlit.types import FileDict
 
 mime_types = {
     "text": "text/plain",
     "tasklist": "application/json",
+    "plotly": "application/json",
 }
+
+ElementType = Literal[
+    "image",
+    "text",
+    "pdf",
+    "tasklist",
+    "audio",
+    "video",
+    "file",
+    "plotly",
+    "dataframe",
+    "custom",
+]
+ElementDisplay = Literal["inline", "side", "page"]
+ElementSize = Literal["small", "medium", "large"]
+
+
+class ElementDict(TypedDict):
+    id: str
+    threadId: Optional[str]
+    type: ElementType
+    chainlitKey: Optional[str]
+    url: Optional[str]
+    objectKey: Optional[str]
+    name: str
+    display: ElementDisplay
+    size: Optional[ElementSize]
+    language: Optional[str]
+    page: Optional[int]
+    props: Optional[Dict]
+    autoPlay: Optional[bool]
+    playerConfig: Optional[dict]
+    forId: Optional[str]
+    mime: Optional[str]
 
 
 @dataclass
 class Element:
+    # Thread id
+    thread_id: str = Field(default_factory=lambda: context.session.thread_id)
     # The type of the element. This will be used to determine how to display the element in the UI.
     type: ClassVar[ElementType]
-
+    # Name of the element, this will be used to reference the element in the UI.
+    name: str = ""
     # The ID of the element. This is set automatically when the element is sent to the UI.
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    # Name of the element, this will be used to reference the element in the UI.
-    name: Optional[str] = None
-    # The URL of the element if already hosted somehwere else.
+    # The key of the element hosted on Chainlit.
+    chainlit_key: Optional[str] = None
+    # The URL of the element if already hosted somewhere else.
     url: Optional[str] = None
     # The S3 object key.
     object_key: Optional[str] = None
@@ -36,17 +88,20 @@ class Element:
     # The byte content of the element.
     content: Optional[Union[bytes, str]] = None
     # Controls how the image element should be displayed in the UI. Choices are “side” (default), “inline”, or “page”.
-    display: ElementDisplay = Field(default="side")
+    display: ElementDisplay = Field(default="inline")
     # Controls element size
     size: Optional[ElementSize] = None
     # The ID of the message this element is associated with.
-    for_ids: List[str] = Field(default_factory=list)
+    for_id: Optional[str] = None
     # The language, if relevant
     language: Optional[str] = None
+    # Mime type, infered based on content if not provided
+    mime: Optional[str] = None
 
     def __post_init__(self) -> None:
         trace_event(f"init {self.__class__.__name__}")
         self.persisted = False
+        self.updatable = False
 
         if not self.url and not self.path and not self.content:
             raise ValueError("Must provide url, path or content to instantiate element")
@@ -55,89 +110,98 @@ class Element:
         _dict = ElementDict(
             {
                 "id": self.id,
+                "threadId": self.thread_id,
                 "type": self.type,
-                "url": self.url or "",
-                "name": self.name or "",
+                "url": self.url,
+                "chainlitKey": self.chainlit_key,
+                "name": self.name,
                 "display": self.display,
                 "objectKey": getattr(self, "object_key", None),
                 "size": getattr(self, "size", None),
+                "props": getattr(self, "props", None),
+                "page": getattr(self, "page", None),
+                "autoPlay": getattr(self, "auto_play", None),
+                "playerConfig": getattr(self, "player_config", None),
                 "language": getattr(self, "language", None),
-                "forIds": getattr(self, "for_ids", None),
-                "conversationId": None,
+                "forId": getattr(self, "for_id", None),
+                "mime": getattr(self, "mime", None),
             }
         )
         return _dict
 
-    async def preprocess_content(self):
-        pass
-
-    async def load(self):
-        if self.path:
-            async with aiofiles.open(self.path, "rb") as f:
-                self.content = await f.read()
-        else:
-            raise ValueError("Must provide path or content to load element")
-
-    async def persist(self, client: BaseDBClient) -> ElementDict:
-        if not self.url and self.content and not self.persisted:
-            # Only guess the mime type when the content is binary
-            mime = (
-                mime_types[self.type]
-                if self.type in mime_types
-                else filetype.guess_mime(self.content)
+    @classmethod
+    def from_dict(self, _dict: FileDict):
+        type = _dict.get("type", "")
+        if "image" in type and "svg" not in type:
+            return Image(
+                id=_dict.get("id", str(uuid.uuid4())),
+                name=_dict.get("name", ""),
+                path=str(_dict.get("path")),
+                chainlit_key=_dict.get("id"),
+                display="inline",
+                mime=type,
             )
-            upload_res = await client.upload_element(content=self.content, mime=mime)
-            self.url = upload_res["url"]
-            self.object_key = upload_res["object_key"]
-
-        if not self.persisted:
-            element_dict = await client.create_element(self.to_dict())
-            self.persisted = True
         else:
-            element_dict = await client.update_element(self.to_dict())
-        return element_dict
+            return File(
+                id=_dict.get("id", str(uuid.uuid4())),
+                name=_dict.get("name", ""),
+                path=str(_dict.get("path")),
+                chainlit_key=_dict.get("id"),
+                display="inline",
+                mime=type,
+            )
 
-    async def before_emit(self, element: Dict) -> Dict:
-        return element
+    async def _create(self) -> bool:
+        if self.persisted and not self.updatable:
+            return True
+        if data_layer := get_data_layer():
+            try:
+                asyncio.create_task(data_layer.create_element(self))
+            except Exception as e:
+                logger.error(f"Failed to create element: {e!s}")
+        if not self.url and (not self.chainlit_key or self.updatable):
+            file_dict = await context.session.persist_file(
+                name=self.name,
+                path=self.path,
+                content=self.content,
+                mime=self.mime or "",
+            )
+            self.chainlit_key = file_dict["id"]
+
+        self.persisted = True
+
+        return True
 
     async def remove(self):
         trace_event(f"remove {self.__class__.__name__}")
+        data_layer = get_data_layer()
+        if data_layer and self.persisted:
+            await data_layer.delete_element(self.id, self.thread_id)
         await context.emitter.emit("remove_element", {"id": self.id})
 
-    async def send(self, for_id: Optional[str] = None):
-        if not self.content and not self.url and self.path:
-            await self.load()
+    async def send(self, for_id: str):
+        if self.persisted and not self.updatable:
+            return
 
-        await self.preprocess_content()
+        self.for_id = for_id
 
-        if for_id and for_id not in self.for_ids:
-            self.for_ids.append(for_id)
+        if not self.mime:
+            if self.type in mime_types:
+                self.mime = mime_types[self.type]
+            elif self.path or isinstance(self.content, (bytes, bytearray)):
+                file_type = filetype.guess(self.path or self.content)
+                if file_type:
+                    self.mime = file_type.mime
+            elif self.url:
+                self.mime = mimetypes.guess_type(self.url)[0]
 
-        # We have a client, persist the element
-        if context.emitter.db_client:
-            element_dict = await self.persist(context.emitter.db_client)
-            self.id = element_dict["id"]
+        await self._create()
 
-        elif not self.url and not self.content:
-            raise ValueError("Must provide url or content to send element")
+        if not self.url and not self.chainlit_key:
+            raise ValueError("Must provide url or chainlit key to send element")
 
-        emit_dict = cast(Dict, self.to_dict())
-
-        # Adding this out of to_dict since the dict will be persisted in the DB
-        emit_dict["content"] = self.content
-
-        if context.emitter.emit:
-            # Element was already sent
-            if len(self.for_ids) > 1:
-                trace_event(f"update {self.__class__.__name__}")
-                await context.emitter.emit(
-                    "update_element",
-                    {"id": self.id, "forIds": self.for_ids},
-                )
-            else:
-                trace_event(f"send {self.__class__.__name__}")
-                emit_dict = await self.before_emit(emit_dict)
-                await context.emitter.emit("element", emit_dict)
+        trace_event(f"send {self.__class__.__name__}")
+        await context.emitter.send_element(self.to_dict())
 
 
 ElementBased = TypeVar("ElementBased", bound=Element)
@@ -151,48 +215,19 @@ class Image(Element):
 
 
 @dataclass
-class Avatar(Element):
-    type: ClassVar[ElementType] = "avatar"
-
-    async def send(self):
-        element = None
-
-        if not self.content and not self.url and self.path:
-            await self.load()
-
-        if not self.url and not self.content:
-            raise ValueError("Must provide url or content to send element")
-
-        element = self.to_dict()
-
-        # Adding this out of to_dict since the dict will be persisted in the DB
-        element["content"] = self.content
-
-        if context.emitter.emit and element:
-            trace_event(f"send {self.__class__.__name__}")
-            element = await self.before_emit(element)
-            await context.emitter.emit("element", element)
-
-
-@dataclass
 class Text(Element):
     """Useful to send a text (not a message) to the UI."""
 
     type: ClassVar[ElementType] = "text"
-
-    content: bytes = b""
     language: Optional[str] = None
-
-    async def before_emit(self, text_element):
-        if "content" in text_element and isinstance(text_element["content"], bytes):
-            text_element["content"] = text_element["content"].decode("utf-8")
-        return text_element
 
 
 @dataclass
 class Pdf(Element):
     """Useful to send a pdf to the UI."""
 
+    mime: str = "application/pdf"
+    page: Optional[int] = None
     type: ClassVar[ElementType] = "pdf"
 
 
@@ -214,14 +249,10 @@ class Pyplot(Element):
         if not isinstance(self.figure, Figure):
             raise TypeError("figure must be a matplotlib.figure.Figure")
 
-        options = {
-            "dpi": 200,
-            "bbox_inches": "tight",
-            "backend": "Agg",
-            "format": "png",
-        }
         image = BytesIO()
-        self.figure.savefig(image, **options)
+        self.figure.savefig(
+            image, dpi=200, bbox_inches="tight", backend="Agg", format="png"
+        )
         self.content = image.getvalue()
 
         super().__post_init__()
@@ -256,19 +287,22 @@ class TaskList(Element):
     type: ClassVar[ElementType] = "tasklist"
     tasks: List[Task] = Field(default_factory=list, exclude=True)
     status: str = "Ready"
+    name: str = "tasklist"
+    content: str = "dummy content to pass validation"
 
-    def __init__(self):
-        self.tasks = []
-        self.content = "dummy content to pass validation"
-        self.name = "tasklist"
-        self.type = "tasklist"
+    def __post_init__(self) -> None:
         super().__post_init__()
+        self.updatable = True
 
     async def add_task(self, task: Task):
         self.tasks.append(task)
 
     async def update(self):
         await self.send()
+
+    async def send(self):
+        await self.preprocess_content()
+        await super().send(for_id="")
 
     async def preprocess_content(self):
         # serialize enum
@@ -282,13 +316,16 @@ class TaskList(Element):
             {
                 "status": self.status,
                 "tasks": tasks,
-            }
+            },
+            indent=4,
+            ensure_ascii=False,
         )
 
 
 @dataclass
 class Audio(Element):
     type: ClassVar[ElementType] = "audio"
+    auto_play: bool = False
 
 
 @dataclass
@@ -296,8 +333,74 @@ class Video(Element):
     type: ClassVar[ElementType] = "video"
 
     size: ElementSize = "medium"
+    # Override settings for each type of player in ReactPlayer
+    # https://github.com/cookpete/react-player?tab=readme-ov-file#config-prop
+    player_config: Optional[dict] = None
 
 
 @dataclass
 class File(Element):
     type: ClassVar[ElementType] = "file"
+
+
+@dataclass
+class Plotly(Element):
+    """Useful to send a plotly to the UI."""
+
+    type: ClassVar[ElementType] = "plotly"
+
+    size: ElementSize = "medium"
+    # The type is set to Any because the figure is not serializable
+    # and its actual type is checked in __post_init__.
+    figure: Any = None
+    content: str = ""
+
+    def __post_init__(self) -> None:
+        from plotly import graph_objects as go, io as pio
+
+        if not isinstance(self.figure, go.Figure):
+            raise TypeError("figure must be a plotly.graph_objects.Figure")
+
+        self.figure.layout.autosize = True
+        self.figure.layout.width = None
+        self.figure.layout.height = None
+        self.content = pio.to_json(self.figure, validate=True)
+        self.mime = "application/json"
+
+        super().__post_init__()
+
+
+@dataclass
+class Dataframe(Element):
+    """Useful to send a pandas DataFrame to the UI."""
+
+    type: ClassVar[ElementType] = "dataframe"
+    size: ElementSize = "large"
+    data: Any = None  # The type is Any because it is checked in __post_init__.
+
+    def __post_init__(self) -> None:
+        """Ensures the data is a pandas DataFrame and converts it to JSON."""
+        from pandas import DataFrame
+
+        if not isinstance(self.data, DataFrame):
+            raise TypeError("data must be a pandas.DataFrame")
+
+        self.content = self.data.to_json(orient="split", date_format="iso")
+        super().__post_init__()
+
+
+@dataclass
+class CustomElement(Element):
+    """Useful to send a custom element to the UI."""
+
+    type: ClassVar[ElementType] = "custom"
+    mime: str = "application/json"
+    props: Dict = Field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.content = json.dumps(self.props)
+        super().__post_init__()
+        self.updatable = True
+
+    async def update(self):
+        await super().send(self.for_id)

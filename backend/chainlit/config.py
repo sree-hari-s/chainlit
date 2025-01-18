@@ -1,47 +1,69 @@
+import json
 import os
+import site
 import sys
 from importlib import util
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Union
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+)
 
 import tomli
-from chainlit.logger import logger
-from chainlit.version import __version__
 from dataclasses_json import DataClassJsonMixin
+from pydantic import Field
 from pydantic.dataclasses import dataclass
 from starlette.datastructures import Headers
 
+from chainlit.data.base import BaseDataLayer
+from chainlit.logger import logger
+from chainlit.translations import lint_translation_json
+from chainlit.version import __version__
+
+from ._utils import is_path_inside
+
 if TYPE_CHECKING:
+    from fastapi import Request, Response
+
     from chainlit.action import Action
-    from chainlit.client.base import BaseAuthClient, BaseDBClient
+    from chainlit.message import Message
+    from chainlit.types import ChatProfile, InputAudioChunk, Starter, ThreadDict
+    from chainlit.user import User
+else:
+    # Pydantic needs to resolve forward annotations. Because all of these are used
+    # within `typing.Callable`, alias to `Any` as Pydantic does not perform validation
+    # of callable argument/return types anyway.
+    Request = Response = Action = Message = ChatProfile = InputAudioChunk = Starter = ThreadDict = User = Any  # fmt: off
 
 BACKEND_ROOT = os.path.dirname(__file__)
 PACKAGE_ROOT = os.path.dirname(os.path.dirname(BACKEND_ROOT))
+TRANSLATIONS_DIR = os.path.join(BACKEND_ROOT, "translations")
 
 
 # Get the directory the script is running from
-APP_ROOT = os.getcwd()
+APP_ROOT = os.getenv("CHAINLIT_APP_ROOT", os.getcwd())
+
+# Create the directory to store the uploaded files
+FILES_DIRECTORY = Path(APP_ROOT) / ".files"
+FILES_DIRECTORY.mkdir(exist_ok=True)
 
 config_dir = os.path.join(APP_ROOT, ".chainlit")
+public_dir = os.path.join(APP_ROOT, "public")
 config_file = os.path.join(config_dir, "config.toml")
+config_translation_dir = os.path.join(config_dir, "translations")
 
 # Default config file created if none exists
 DEFAULT_CONFIG_STR = f"""[project]
-# If true (default), the app will be available to anonymous users.
-# If false, users will need to authenticate and be part of the project to use the app.
-public = true
-
-# The project ID (found on https://cloud.chainlit.io).
-# The project ID is required when public is set to false or when using the cloud database.
-#id = ""
-
-# Uncomment if you want to persist the chats.
-# local will create a database in your .chainlit directory (requires node.js installed).
-# cloud will use the Chainlit cloud database.
-# custom will load use your custom client.
-# database = "local"
-
 # Whether to enable telemetry (default: true). No personal data is collected.
 enable_telemetry = true
+
 
 # List of environment variables to be provided by each user to use the app.
 user_env = []
@@ -49,68 +71,89 @@ user_env = []
 # Duration (in seconds) during which the session is saved when the connection is lost
 session_timeout = 3600
 
+# Duration (in seconds) of the user session expiry
+user_session_timeout = 1296000  # 15 days
+
 # Enable third parties caching (e.g LangChain cache)
 cache = false
 
-# Follow symlink for asset mount (see https://github.com/Chainlit/chainlit/issues/317)
-# follow_symlink = false
+# Authorized origins
+allow_origins = ["*"]
 
-# Chainlit server address
-# chainlit_server = ""
+[features]
+# Process and display HTML in messages. This can be a security risk (see https://stackoverflow.com/questions/19603097/why-is-it-dangerous-to-render-user-generated-html-or-javascript)
+unsafe_allow_html = false
+
+# Process and display mathematical expressions. This can clash with "$" characters in messages.
+latex = false
+
+# Automatically tag threads with the current chat profile (if a chat profile is used)
+auto_tag_thread = true
+
+# Allow users to edit their own messages
+edit_message = true
+
+# Authorize users to spontaneously upload files with messages
+[features.spontaneous_file_upload]
+    enabled = true
+    # Define accepted file types using MIME types
+    # Examples:
+    # 1. For specific file types:
+    #    accept = ["image/jpeg", "image/png", "application/pdf"]
+    # 2. For all files of certain type:
+    #    accept = ["image/*", "audio/*", "video/*"]
+    # 3. For specific file extensions:
+    #    accept = {{ "application/octet-stream" = [".xyz", ".pdb"] }}
+    # Note: Using "*/*" is not recommended as it may cause browser warnings
+    accept = ["*/*"]
+    max_files = 20
+    max_size_mb = 500
+
+[features.audio]
+    # Sample rate of the audio
+    sample_rate = 24000
 
 [UI]
-# Name of the app and chatbot.
-name = "Chatbot"
+# Name of the assistant.
+name = "Assistant"
 
-# Description of the app and chatbot. This is used for HTML tags.
+# default_theme = "dark"
+
+# layout = "wide"
+
+# Description of the assistant. This is used for HTML tags.
 # description = ""
 
-# Large size content are by default collapsed for a cleaner ui
-default_collapse_content = true
-
-# The default value for the expand messages settings.
-default_expand_messages = false
-
-# Hide the chain of thought details from the user in the UI.
-hide_cot = false
+# Chain of Thought (CoT) display mode. Can be "hidden", "tool_call" or "full".
+cot = "full"
 
 # Link to your github repo. This will add a github button in the UI's header.
 # github = ""
 
-# Show the prompt playground
-show_prompt_playground = true
+# Specify a CSS file that can be used to customize the user interface.
+# The CSS file can be served from the public directory or via an external link.
+# custom_css = "/public/test.css"
 
-# Override default MUI light theme. (Check theme.ts)
-[UI.theme.light]
-    #background = "#FAFAFA"
-    #paper = "#FFFFFF"
+# Specify a Javascript file that can be used to customize the user interface.
+# The Javascript file can be served from the public directory.
+# custom_js = "/public/test.js"
 
-    [UI.theme.light.primary]
-        #main = "#F80061"
-        #dark = "#980039"
-        #light = "#FFE7EB"
+# Specify a custom meta image url.
+# custom_meta_image_url = "https://chainlit-cloud.s3.eu-west-3.amazonaws.com/logo/chainlit_banner.png"
 
-# Override default MUI dark theme. (Check theme.ts)
-[UI.theme.dark]
-    #background = "#FAFAFA"
-    #paper = "#FFFFFF"
-
-    [UI.theme.dark.primary]
-        #main = "#F80061"
-        #dark = "#980039"
-        #light = "#FFE7EB"
-
+# Specify a custom build directory for the frontend.
+# This can be used to customize the frontend code.
+# Be careful: If this is a relative path, it should not start with a slash.
+# custom_build = "./public/build"
 
 [meta]
 generated_by = "{__version__}"
 """
 
-chainlit_prod_url = os.environ.get("CHAINLIT_PROD_URL")
-default_chainlit_server = "https://cloud.chainlit.io"
 
-
-DEFAULT_HOST = "0.0.0.0"
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
+DEFAULT_ROOT_PATH = ""
 
 
 @dataclass()
@@ -119,6 +162,9 @@ class RunSettings:
     module_name: Optional[str] = None
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
+    ssl_cert: Optional[str] = None
+    ssl_key: Optional[str] = None
+    root_path: str = DEFAULT_ROOT_PATH
     headless: bool = False
     watch: bool = False
     no_cache: bool = False
@@ -134,30 +180,59 @@ class PaletteOptions(DataClassJsonMixin):
 
 
 @dataclass()
+class TextOptions(DataClassJsonMixin):
+    primary: Optional[str] = ""
+    secondary: Optional[str] = ""
+
+
+@dataclass()
 class Palette(DataClassJsonMixin):
     primary: Optional[PaletteOptions] = None
     background: Optional[str] = ""
     paper: Optional[str] = ""
+    text: Optional[TextOptions] = None
+
+
+@dataclass
+class SpontaneousFileUploadFeature(DataClassJsonMixin):
+    enabled: Optional[bool] = None
+    accept: Optional[Union[List[str], Dict[str, List[str]]]] = None
+    max_files: Optional[int] = None
+    max_size_mb: Optional[int] = None
+
+
+@dataclass
+class AudioFeature(DataClassJsonMixin):
+    sample_rate: int = 24000
+    enabled: bool = False
 
 
 @dataclass()
-class Theme(DataClassJsonMixin):
-    light: Optional[Palette] = None
-    dark: Optional[Palette] = None
+class FeaturesSettings(DataClassJsonMixin):
+    spontaneous_file_upload: Optional[SpontaneousFileUploadFeature] = None
+    audio: Optional[AudioFeature] = Field(default_factory=AudioFeature)
+    latex: bool = False
+    unsafe_allow_html: bool = False
+    auto_tag_thread: bool = True
+    edit_message: bool = True
 
 
 @dataclass()
 class UISettings(DataClassJsonMixin):
     name: str
     description: str = ""
-    hide_cot: bool = False
-    # Large size content are by default collapsed for a cleaner ui
-    default_collapse_content: bool = True
-    default_expand_messages: bool = False
+    cot: Literal["hidden", "tool_call", "full"] = "full"
+    font_family: Optional[str] = None
+    default_theme: Optional[Literal["light", "dark"]] = "dark"
+    layout: Optional[Literal["default", "wide"]] = "default"
     github: Optional[str] = None
-    theme: Optional[Theme] = None
-    # Show the prompt playground
-    show_prompt_playground: bool = True
+    # Optional custom CSS file that allows you to customize the UI
+    custom_css: Optional[str] = None
+    custom_js: Optional[str] = None
+    # Optional custom meta tag for image preview
+    custom_meta_image_url: Optional[str] = None
+    # Optional custom build directory for the frontend
+    custom_build: Optional[str] = None
 
 
 @dataclass()
@@ -167,60 +242,54 @@ class CodeSettings:
     # Module object loaded from the module_name
     module: Any = None
     # Bunch of callbacks defined by the developer
+    password_auth_callback: Optional[
+        Callable[[str, str], Awaitable[Optional["User"]]]
+    ] = None
+    header_auth_callback: Optional[Callable[[Headers], Awaitable[Optional["User"]]]] = (
+        None
+    )
+    oauth_callback: Optional[
+        Callable[[str, str, Dict[str, str], "User"], Awaitable[Optional["User"]]]
+    ] = None
+    on_logout: Optional[Callable[["Request", "Response"], Any]] = None
     on_stop: Optional[Callable[[], Any]] = None
     on_chat_start: Optional[Callable[[], Any]] = None
-    on_message: Optional[Callable[[str], Any]] = None
-    on_file_upload: Optional[Callable[[str], Any]] = None
-    auth_client_factory: Optional[
-        Callable[[Optional[Dict[str, str]], Optional[Headers]], "BaseAuthClient"]
-    ] = None
-    db_client_factory: Optional[
-        Callable[[Optional[Dict[str, str]], Optional[Headers], Dict], "BaseDBClient"]
-    ] = None
-    author_rename: Optional[Callable[[str], str]] = None
+    on_chat_end: Optional[Callable[[], Any]] = None
+    on_chat_resume: Optional[Callable[["ThreadDict"], Any]] = None
+    on_message: Optional[Callable[["Message"], Any]] = None
+    on_window_message: Optional[Callable[[str], Any]] = None
+    on_audio_start: Optional[Callable[[], Any]] = None
+    on_audio_chunk: Optional[Callable[["InputAudioChunk"], Any]] = None
+    on_audio_end: Optional[Callable[[], Any]] = None
+
+    author_rename: Optional[Callable[[str], Awaitable[str]]] = None
     on_settings_update: Optional[Callable[[Dict[str, Any]], Any]] = None
-
-    def validate(self):
-        requires_one_of = [
-            "on_message",
-            "on_chat_start",
-        ]
-
-        # Check if at least one of the required attributes is set
-        if not any(getattr(self, attr) for attr in requires_one_of):
-            raise ValueError(
-                f"Module should at least expose one of {', '.join(requires_one_of)} function"
-            )
-
-        return True
+    set_chat_profiles: Optional[
+        Callable[[Optional["User"]], Awaitable[List["ChatProfile"]]]
+    ] = None
+    set_starters: Optional[Callable[[Optional["User"]], Awaitable[List["Starter"]]]] = (
+        None
+    )
+    data_layer: Optional[Callable[[], BaseDataLayer]] = None
 
 
 @dataclass()
 class ProjectSettings(DataClassJsonMixin):
-    # Enables Cloud features if provided
-    id: Optional[str] = None
-    # Whether the app is available to anonymous users or only to team members.
-    public: bool = True
-    # Storage type
-    database: Optional[Literal["local", "cloud", "custom"]] = None
-    # Whether to enable telemetry. No personal data is collected.
+    allow_origins: List[str] = Field(default_factory=lambda: ["*"])
+    # Socket.io client transports option
+    transports: Optional[List[str]] = None
     enable_telemetry: bool = True
     # List of environment variables to be provided by each user to use the app. If empty, no environment variables will be asked to the user.
     user_env: Optional[List[str]] = None
     # Path to the local langchain cache database
     lc_cache_path: Optional[str] = None
     # Path to the local chat db
-    local_db_path: Optional[str] = None
-    # Path to the local file system
-    local_fs_path: Optional[str] = None
     # Duration (in seconds) during which the session is saved when the connection is lost
     session_timeout: int = 3600
+    # Duration (in seconds) of the user session expiry
+    user_session_timeout: int = 1296000  # 15 days
     # Enable third parties caching (e.g LangChain cache)
     cache: bool = False
-    # Follow symlink for asset mount (see https://github.com/Chainlit/chainlit/issues/317)
-    follow_symlink: bool = False
-    # Chainlit server address
-    chainlit_server: Optional[str] = None
 
 
 @dataclass()
@@ -229,13 +298,55 @@ class ChainlitConfig:
     root = APP_ROOT
     # Chainlit server URL. Used only for cloud features
     chainlit_server: str
-    # The url of the deployed app. Only set if the app is deployed.
-    chainlit_prod_url = chainlit_prod_url
-
     run: RunSettings
+    features: FeaturesSettings
     ui: UISettings
     project: ProjectSettings
     code: CodeSettings
+
+    def load_translation(self, language: str):
+        translation = {}
+        default_language = "en-US"
+        # fallback to root language (ex: `de` when `de-DE` is not found)
+        parent_language = language.split("-")[0]
+
+        translation_dir = Path(config_translation_dir)
+
+        translation_lib_file_path = translation_dir / f"{language}.json"
+        translation_lib_parent_language_file_path = (
+            translation_dir / f"{parent_language}.json"
+        )
+        default_translation_lib_file_path = translation_dir / f"{default_language}.json"
+
+        if (
+            is_path_inside(translation_lib_file_path, translation_dir)
+            and translation_lib_file_path.is_file()
+        ):
+            translation = json.loads(
+                translation_lib_file_path.read_text(encoding="utf-8")
+            )
+        elif (
+            is_path_inside(translation_lib_parent_language_file_path, translation_dir)
+            and translation_lib_parent_language_file_path.is_file()
+        ):
+            logger.warning(
+                f"Translation file for {language} not found. Using parent translation {parent_language}."
+            )
+            translation = json.loads(
+                translation_lib_parent_language_file_path.read_text(encoding="utf-8")
+            )
+        elif (
+            is_path_inside(default_translation_lib_file_path, translation_dir)
+            and default_translation_lib_file_path.is_file()
+        ):
+            logger.warning(
+                f"Translation file for {language} not found. Using default translation {default_language}."
+            )
+            translation = json.loads(
+                default_translation_lib_file_path.read_text(encoding="utf-8")
+            )
+
+        return translation
 
 
 def init_config(log=False):
@@ -248,8 +359,25 @@ def init_config(log=False):
     elif log:
         logger.info(f"Config file already exists at {config_file}")
 
+    if not os.path.exists(config_translation_dir):
+        os.makedirs(config_translation_dir, exist_ok=True)
+        logger.info(
+            f"Created default translation directory at {config_translation_dir}"
+        )
 
-def load_module(target: str):
+    for file in os.listdir(TRANSLATIONS_DIR):
+        if file.endswith(".json"):
+            dst = os.path.join(config_translation_dir, file)
+            if not os.path.exists(dst):
+                src = os.path.join(TRANSLATIONS_DIR, file)
+                with open(src, encoding="utf-8") as f:
+                    translation = json.load(f)
+                    with open(dst, "w", encoding="utf-8") as f:
+                        json.dump(translation, f, indent=4)
+                        logger.info(f"Created default translation file at {dst}")
+
+
+def load_module(target: str, force_refresh: bool = False):
     """Load the specified module."""
 
     # Get the target's directory
@@ -257,6 +385,20 @@ def load_module(target: str):
 
     # Add the target's directory to the Python path
     sys.path.insert(0, target_dir)
+
+    if force_refresh:
+        # Get current site packages dirs
+        site_package_dirs = site.getsitepackages()
+
+        # Clear the modules related to the app from sys.modules
+        for module_name, module in list(sys.modules.items()):
+            if (
+                hasattr(module, "__file__")
+                and module.__file__
+                and module.__file__.startswith(target_dir)
+                and not any(module.__file__.startswith(p) for p in site_package_dirs)
+            ):
+                sys.modules.pop(module_name, None)
 
     spec = util.spec_from_file_location(target, target)
     if not spec or not spec.loader:
@@ -273,46 +415,39 @@ def load_module(target: str):
     # Remove the target's directory from the Python path
     sys.path.pop(0)
 
-    config.code.validate()
-
 
 def load_settings():
     with open(config_file, "rb") as f:
         toml_dict = tomli.load(f)
         # Load project settings
         project_config = toml_dict.get("project", {})
+        features_settings = toml_dict.get("features", {})
         ui_settings = toml_dict.get("UI", {})
         meta = toml_dict.get("meta")
 
         if not meta or meta.get("generated_by") <= "0.3.0":
             raise ValueError(
-                "Your config file is outdated. Please delete it and restart the app to regenerate it."
+                f"Your config file '{config_file}' is outdated. Please delete it and restart the app to regenerate it."
             )
 
         lc_cache_path = os.path.join(config_dir, ".langchain.db")
-        local_db_path = os.path.join(config_dir, "chat.db")
-        local_fs_path = os.path.join(config_dir, "chat_files")
-
-        os.environ[
-            "LOCAL_DB_PATH"
-        ] = f"file:{local_db_path}?socket_timeout=10&connection_limit=1"
 
         project_settings = ProjectSettings(
             lc_cache_path=lc_cache_path,
-            local_db_path=local_db_path,
-            local_fs_path=local_fs_path,
             **project_config,
         )
 
+        features_settings = FeaturesSettings(**features_settings)
+
         ui_settings = UISettings(**ui_settings)
 
-        if not project_settings.public and not project_settings.id:
-            raise ValueError("Project ID is required when public is set to false.")
+        code_settings = CodeSettings(action_callbacks={})
 
         return {
+            "features": features_settings,
             "ui": ui_settings,
             "project": project_settings,
-            "code": CodeSettings(action_callbacks={}),
+            "code": code_settings,
         }
 
 
@@ -324,6 +459,7 @@ def reload_config():
 
     settings = load_settings()
 
+    config.features = settings["features"]
     config.code = settings["code"]
     config.ui = settings["ui"]
     config.project = settings["project"]
@@ -335,19 +471,33 @@ def load_config():
 
     settings = load_settings()
 
-    chainlit_server = default_chainlit_server
-    project_settings = settings.get("project")
-    if project_settings and project_settings.chainlit_server:
-        chainlit_server = project_settings.chainlit_server
+    chainlit_server = os.environ.get("CHAINLIT_SERVER", "https://cloud.chainlit.io")
 
     config = ChainlitConfig(
         chainlit_server=chainlit_server,
-        chainlit_prod_url=chainlit_prod_url,
         run=RunSettings(),
         **settings,
     )
 
     return config
+
+
+def lint_translations():
+    # Load the ground truth (en-US.json file from chainlit source code)
+    src = os.path.join(TRANSLATIONS_DIR, "en-US.json")
+    with open(src, encoding="utf-8") as f:
+        truth = json.load(f)
+
+        # Find the local app translations
+        for file in os.listdir(config_translation_dir):
+            if file.endswith(".json"):
+                # Load the translation file
+                to_lint = os.path.join(config_translation_dir, file)
+                with open(to_lint, encoding="utf-8") as f:
+                    translation = json.load(f)
+
+                    # Lint the translation file
+                    lint_translation_json(file, truth, translation)
 
 
 config = load_config()

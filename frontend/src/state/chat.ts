@@ -1,71 +1,18 @@
-import { atom, selector } from 'recoil';
+import { atom } from 'recoil';
 
-import { TFormInput } from 'components/organisms/FormInput';
+export interface IAttachment {
+  id: string;
+  serverId?: string;
+  name: string;
+  size: number;
+  type: string;
+  uploadProgress?: number;
+  uploaded?: boolean;
+  cancel?: () => void;
+  remove?: () => void;
+}
 
-import { FileSpec, IAsk, IMessage, ISession } from 'types/chat';
-
-export const sessionState = atom<ISession | undefined>({
-  key: 'Session',
-  dangerouslyAllowMutability: true,
-  default: undefined
-});
-
-export const messagesState = atom<IMessage[]>({
-  key: 'Messages',
-  dangerouslyAllowMutability: true,
+export const attachmentsState = atom<IAttachment[]>({
+  key: 'Attachments',
   default: []
-});
-
-export const tokenCountState = atom<number>({
-  key: 'TokenCount',
-  default: 0
-});
-
-export const loadingState = atom<boolean>({
-  key: 'Loading',
-  default: false
-});
-
-export const fileSpecState = atom<FileSpec | undefined>({
-  key: 'FileSpec',
-  default: undefined
-});
-
-export const askUserState = atom<IAsk | undefined>({
-  key: 'AskUser',
-  default: undefined
-});
-
-export const highlightMessage = atom<IMessage['id'] | null>({
-  key: 'HighlightMessage',
-  default: null
-});
-
-export const chatSettingsState = atom<{
-  open: boolean;
-  inputs: TFormInput[];
-}>({
-  key: 'ChatSettings',
-  default: {
-    open: false,
-    inputs: []
-  }
-});
-
-export const chatSettingsDefaultValueSelector = selector({
-  key: 'ChatSettingsValue/Default',
-  get: ({ get }) => {
-    const chatSettings = get(chatSettingsState);
-    return chatSettings.inputs.reduce(
-      (form: { [key: string]: any }, input: TFormInput) => (
-        (form[input.id] = input.initial), form
-      ),
-      {}
-    );
-  }
-});
-
-export const chatSettingsValueState = atom({
-  key: 'ChatSettingsValue',
-  default: chatSettingsDefaultValueSelector
 });

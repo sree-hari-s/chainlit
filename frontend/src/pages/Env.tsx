@@ -1,115 +1,113 @@
-import { useFormik } from 'formik';
-import { toast } from 'react-hot-toast';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { useForm } from 'react-hook-form';
+import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { useRecoilState, useRecoilValue } from 'recoil';
-import * as yup from 'yup';
+import { useRecoilState } from 'recoil';
+import { toast } from 'sonner';
+import { z } from 'zod';
 
-import { Alert, Box, Button, Typography } from '@mui/material';
+import { useConfig } from '@chainlit/react-client';
 
-import { TextInput } from '@chainlit/components';
+import Alert from '@/components/Alert';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 
-import TopBar from 'components/organisms/header';
+import { useLayoutMaxWidth } from '@/hooks/useLayoutMaxWidth';
 
-import { projectSettingsState } from 'state/project';
-import { userEnvState } from 'state/user';
+import { userEnvState } from '@/state/user';
 
-export default function Env() {
-  const [userEnv, setUserEnv] = useRecoilState(userEnvState);
-  const pSettings = useRecoilValue(projectSettingsState);
+const Env = () => {
   const navigate = useNavigate();
+  const { config } = useConfig();
+  const [userEnv, setUserEnv] = useRecoilState(userEnvState);
+  const layoutMaxWidth = useLayoutMaxWidth();
+  const { t } = useTranslation();
+  const requiredKeys = config?.userEnv || [];
 
-  const requiredKeys = pSettings?.project.user_env || [];
-
+  // Create initial values object
   const initialValues: Record<string, string> = {};
-  const _schema: Record<string, yup.StringSchema> = {};
-
   requiredKeys.forEach((key) => {
     initialValues[key] = userEnv[key] || '';
-    _schema[key] = yup.string().required();
   });
 
-  const schema = yup.object(_schema);
-
-  const formik = useFormik({
-    initialValues,
-    validationSchema: schema,
-    onSubmit: async (values) => {
-      localStorage.setItem('userEnv', JSON.stringify(values));
-      setUserEnv(values);
-      toast.success('Saved successfully');
-      navigate('/');
-    }
+  // Create dynamic Zod schema based on required keys
+  const schemaObject: Record<string, z.ZodString> = {};
+  requiredKeys.forEach((key) => {
+    schemaObject[key] = z.string().min(1, { message: 'Required' });
   });
+  const schema = z.object(schemaObject);
+
+  type FormValues = z.infer<typeof schema>;
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, touchedFields }
+  } = useForm<FormValues>({
+    defaultValues: initialValues,
+    resolver: zodResolver(schema),
+    mode: 'onBlur'
+  });
+
+  const onSubmit = async (values: FormValues) => {
+    localStorage.setItem('userEnv', JSON.stringify(values));
+    setUserEnv(values);
+    toast.success(t('pages.Env.savedSuccessfully'));
+    navigate('/');
+  };
 
   if (requiredKeys.length === 0) {
     navigate('/');
+    return null;
   }
 
-  const renderInput = (key: string) => {
-    const hasError = !!formik.errors[key];
-
-    return (
-      <TextInput
-        id={key}
-        className={key}
-        label={key}
-        value={formik.values[key]}
-        size="medium"
-        hasError={hasError}
-        description={hasError ? formik.errors[key] : ''}
-        onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-          formik.setFieldValue(key, e.target.value)
-        }
-      />
-    );
-  };
-
   return (
-    <Box
-      sx={{
-        display: 'flex',
-        flexDirection: 'column',
-        flexGrow: 1
-      }}
-    >
-      <TopBar />
-      <Box
-        id="env"
-        display="flex"
-        flexDirection="column"
-        flexGrow={1}
-        gap={2}
-        sx={{
-          maxWidth: '60rem',
-          width: '100%',
-          mx: 'auto'
-        }}
+    <div className="flex flex-col flex-grow">
+      <div
+        className="flex flex-col flex-grow gap-4 mx-auto w-full"
+        style={{ maxWidth: layoutMaxWidth }}
       >
-        <Typography
-          mt={5}
-          fontSize="18px"
-          fontWeight={700}
-          color="text.primary"
-        >
-          Required API keys
-        </Typography>
-        <Alert severity="info">
-          To use this app, the following API keys are required. The keys are
-          stored on your device's local storage.
-        </Alert>
-        <form onSubmit={formik.handleSubmit}>
-          {requiredKeys.map((key) => renderInput(key))}
-          <Button
-            id="submit-env"
-            fullWidth
-            type="submit"
-            variant="contained"
-            sx={{ mt: 1 }}
-          >
-            Save
-          </Button>
-        </form>
-      </Box>
-    </Box>
+        <Card className="mt-8">
+          <CardHeader>
+            <CardTitle className="text-lg font-bold">
+              {t('pages.Env.requiredApiKeys')}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Alert variant="info" className="mb-6">
+              {t('pages.Env.requiredApiKeysInfo')}
+            </Alert>
+
+            <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+              {requiredKeys.map((key) => (
+                <div key={key} className="space-y-2">
+                  <Label htmlFor={key}>{key}</Label>
+                  <Input
+                    id={key}
+                    {...register(key)}
+                    className={
+                      touchedFields[key] && errors[key] ? 'border-red-500' : ''
+                    }
+                  />
+                  {touchedFields[key] && errors[key] && (
+                    <p className="text-sm text-red-500">
+                      {errors[key]?.message}
+                    </p>
+                  )}
+                </div>
+              ))}
+
+              <Button id="submit-env" type="submit" className="w-full mt-4">
+                Save
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
   );
-}
+};
+
+export default Env;

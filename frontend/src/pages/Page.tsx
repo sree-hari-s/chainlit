@@ -1,14 +1,15 @@
-import { useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Navigate } from 'react-router-dom';
 import { useRecoilValue } from 'recoil';
 
-import { Alert, Box } from '@mui/material';
+import { sideViewState, useAuth, useConfig } from '@chainlit/react-client';
 
-import Header from 'components/organisms/header';
+import ElementSideView from '@/components/ElementSideView';
+import LeftSidebar from '@/components/LeftSidebar';
+import { TaskList } from '@/components/Tasklist';
+import { Header } from '@/components/header';
+import { ResizablePanel, ResizablePanelGroup } from '@/components/ui/resizable';
+import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar';
 
-import { useAuth } from 'hooks/auth';
-
-import { projectSettingsState } from 'state/project';
 import { userEnvState } from 'state/user';
 
 type Props = {
@@ -16,51 +17,47 @@ type Props = {
 };
 
 const Page = ({ children }: Props) => {
-  const {
-    isProjectMember,
-    authenticating,
-    isAuthenticated,
-    accessToken,
-    role
-  } = useAuth();
-  const pSettings = useRecoilValue(projectSettingsState);
+  const { config } = useConfig();
+  const { data } = useAuth();
   const userEnv = useRecoilValue(userEnvState);
-  const navigate = useNavigate();
+  const sideViewElement = useRecoilValue(sideViewState);
 
-  const isPrivate = pSettings && !pSettings.project?.public;
-
-  useEffect(() => {
-    if (pSettings?.project?.user_env) {
-      for (const key of pSettings.project?.user_env || []) {
-        if (!userEnv[key]) navigate('/env');
-      }
+  if (config?.userEnv) {
+    for (const key of config.userEnv || []) {
+      if (!userEnv[key]) return <Navigate to="/env" />;
     }
-    if (isPrivate && !isAuthenticated && !authenticating) {
-      navigate('/login');
-    }
-  }, [pSettings, isAuthenticated, authenticating, userEnv]);
-
-  if (!pSettings || (isPrivate && (!accessToken || !role))) {
-    return null;
   }
 
-  const notAllowed = isPrivate && role && !isProjectMember;
+  const content = (
+    <ResizablePanelGroup
+      direction="horizontal"
+      className="flex flex-row h-full w-full"
+    >
+      <ResizablePanel
+        className="flex flex-col h-full w-full"
+        minSize={60}
+        defaultSize={50}
+      >
+        <Header />
+        <div className="flex flex-row flex-grow overflow-auto">{children}</div>
+      </ResizablePanel>
+      {sideViewElement ? <ElementSideView /> : <TaskList isMobile={false} />}
+    </ResizablePanelGroup>
+  );
+
+  const historyEnabled = config?.dataPersistence && data?.requireLogin;
 
   return (
-    <Box
-      sx={{
-        display: 'flex',
-        flexDirection: 'column',
-        width: '100%'
-      }}
-    >
-      <Header />
-      {notAllowed ? (
-        <Alert severity="error">You are not part of this project.</Alert>
+    <SidebarProvider>
+      {historyEnabled ? (
+        <>
+          <LeftSidebar />
+          <SidebarInset className="max-h-svh">{content}</SidebarInset>
+        </>
       ) : (
-        children
+        <div className="h-screen w-screen flex">{content}</div>
       )}
-    </Box>
+    </SidebarProvider>
   );
 };
 
